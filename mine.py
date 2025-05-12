@@ -11,6 +11,8 @@ SUBSAMPLE_FACTOR = 20
 
 #Warning suppression
 warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore')
+
 
 # Butterworth 1 Hz low-pass filter
 def lpf(x, f=1., fs=FS):
@@ -41,65 +43,94 @@ def jitter(x, snr_db=25):
 	xn = x + n
 	return xn
 
-def augmentation(x):
+def augmentation(x, y):
     x_aug = []
+    y_aug = []
     for i in range(len(x)):
-         x_aug.append(x[i])
-         x_aug.append(jitter(x[i]))
-    return np.array(x_aug, dtype=object)
-
-class DataGenerator(keras.utils.Sequence):
-    def __init__(self, x_data, y_data, batch_size=32, window_size=15, window_step=6, dim=(15,10,1), classes=10, shuffle=True):
+        x_aug.append(x[i])
+        y_aug.append(y[i])
         
-        self.x_data = x_data
-        self.y_data = y_data
+        # Jittered version
+        jittered = jitter(x[i])  
+        x_aug.append(jittered)
+        y_aug.append(y[i])  
+    
+    return np.array(x_aug, dtype=object), np.array(y_aug, dtype=object)
+
+#Data Generator
+class DataGenerator(keras.utils.Sequence):
+    def __init__(self, x, y, batch_size=32,min_max_norm=True, dim=(15,10,1), classes=10, window_size=15, window_step=6, shuffle=True):
+        self.x = x  
+        self.y = y  
         self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.min_max_norm = min_max_norm
+        self.dim = dim
         self.window_size = window_size
         self.window_step = window_step
         self.classes = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-        self.shuffle = shuffle
-
+        self.indexes = np.arange(len(self.x))
         self.__make_segments()
-
-        if self.shuffle:
-            np.random.shuffle(self.indexes)
+        self.__make_class_index()
+        self.on_epoch_end()
 
     def __len__(self):
-        #Batches per epoch
-        return int(np.floor(len(self.indexes) / self.batch_size))
+        return int(np.floor(len(self.x) / self.batch_size))
 
     def __getitem__(self, index):
-        #Creates a batch of data
         indexes = self.indexes[index * self.batch_size:(index + 1) * self.batch_size]
-        return self.__data_generation(indexes)
+        output = self.__data_generation(indexes)
+        return output
     
-    def on_epoch_end(self):
-        #Updates indexes after each epoch
-        if self.shuffle:
-            np.random.shuffle(self.indexes)
-
-    def __data_generation(self, indexes):
-        #Creates data for a batch
-        X = np.empty((self.batch_size, self.window_size, 1))  # Σχήμα εισόδου για 1D δεδομένα
-        y = np.empty((self.batch_size), dtype=int)
-
-        for k, index in enumerate(indexes):
-            i, j = self.x_offsets[index]
-            x_aug = np.copy(self.x_data[i][j:j + self.window_size])  #Sliding window
-            X[k, ] = np.reshape(x_aug, (self.window_size, 1))  #Reshape for the model
-            y[k] = self.y_data[i]
-
-        y = keras.utils.to_categorical(y, num_classes=len(self.classes))  #One-hot encoding
-        return X, y
-
     def __make_segments(self):
-        #Windowing for all data
         x_offsets = []
-        for i in range(len(self.x_data)):
-            for j in range(0, len(self.x_data[i]) - self.window_size, self.window_step):
+        for i in range(len(self.x)):
+            for j in range(0, len(self.x[i]) - self.window_size, self.window_step):
                 x_offsets.append((i, j))
+        
         self.x_offsets = x_offsets
         self.indexes = np.arange(len(self.x_offsets))
+
+    def __make_class_index(self):
+        self.n_classes = len(self.classes)
+        self.classes.sort()
+        self.class_index = np.zeros(np.max(self.classes) + 1, dtype=int)
+        for i, j in enumerate(self.classes):
+            self.class_index[j] = i 
+    
+    def __data_generation(self, indexes):
+        X = np.empty((self.batch_size, *self.dim))            
+        y = np.empty((self.batch_size), dtype=int)
+
+        # Δημιουργία δεδομένων
+        for k, index in enumerate(indexes):
+            i, j = self.x_offsets[index]
+            # Αποθήκευση δείγματος
+            x = self.x[i][j:j + self.window_size]  
+
+            if self.min_max_norm:
+                max_x = x.max()
+                min_x = x.min()
+                x = (x - min_x) / (max_x - min_x)  
+
+            if np.prod(x.shape) == np.prod(self.dim):
+                x = np.reshape(x, self.dim)  # Αναδιάταξη αν είναι απαραίτητο
+            else:
+                raise Exception(f'Generated sample dimension mismatch. Found {x.shape}, expected {self.dim}.')
+
+            X[k, ] = x
+
+            # Αποθήκευση κλάσης
+            y[k] = self.class_index[int(self.y[i])]
+
+        y = keras.utils.to_categorical(y, num_classes=self.n_classes)
+
+        output = (X, y)
+        return output
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.indexes)
 
 
 #Load EMG data
@@ -119,23 +150,26 @@ def load_emg_data(data_dir, subjects, gestures, reps):
                             data = loadmat(file_path)['emg']
                             data = lpf(data)
                             rest_data.append(data)
-
+                            gesture_stim = int(loadmat(file_path)['stimulus'][0][0])
+                                 
                 rest_data = subsample_rest_data(rest_data, rest_reps=10)           
 
                 for data in rest_data:
                     x.append(data)
-                    y.append(gesture)
-
+                    y.append(gesture_stim)
+                
             else:
                 for rep in reps:
                     file_path = os.path.join(gesture_dir, f"rep-{rep:02d}.mat")
                     if os.path.exists(file_path):
                         data = loadmat(file_path)['emg']
                         data = lpf(data)
+                        gesture_stim = int(loadmat(file_path)['stimulus'][0][0])
                         x.append(data)
-                        y.append(gesture)
-      
-    x = augmentation(x)
+                        y.append(gesture_stim)
+    #print(x)
+    #print(y)  
+    x,y = augmentation(x,y)
 
     return np.array(x, dtype=object), np.array(y, dtype=object)
 
@@ -150,11 +184,12 @@ if __name__ == "__main__":
     x, y = load_emg_data(DATA_DIR, SUBJECTS, GESTURES, REPS)
     print(f"Loaded EMG data shape: {x.shape}")
     
-    data_generator = DataGenerator(x_data=x, y_data=y, batch_size=32, window_size=15, window_step=6, classes=52, shuffle=True)
+    # Initialize the data generator
+    data_generator = DataGenerator(x, y, batch_size=32, window_size=15, window_step=6)
 
-    # Example of using the DataGenerator
-    for X_batch, y_batch in data_generator:
-        print(X_batch.shape, y_batch.shape)
-        break  # Για να δούμε μόνο το πρώτο batch
+    # Example of how to get a batch of data
+    x_batch, y_batch = data_generator[0]
+    print(f"x_batch shape: {x_batch.shape}, y_batch shape: {y_batch.shape}")
+   
 
     
